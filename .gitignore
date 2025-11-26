@@ -1,0 +1,6 @@
+.vscode
+documentation/
+*.txt
+__pycache__/
+*egg-info
+.pytest_cache/

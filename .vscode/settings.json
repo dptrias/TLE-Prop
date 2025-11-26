@@ -1,0 +1,12 @@
+{
+    "spellright.language": [
+        "en"
+    ],
+    "spellright.documentTypes": [
+        "markdown",
+        "latex",
+        "yaml"
+    ],
+    "python.defaultInterpreterPath": "${workspaceFolder}/../.practical-astro/bin/python3",
+
+}

@@ -1,0 +1,29 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.3.0",
+    "configurations": [
+        {
+            "name": "Debug TLE Propagator",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "tle_propagator.cli",
+            "justMyCode": false,
+            "args": [
+                "--norad_id",
+                "52158",
+                "-o",
+                "output",
+                "--start_time",
+                "0",
+                "--end_time",
+                "10",
+                "--time_step",
+                "1e-3",
+                //"--plot",
+                //"--yaml"
+            ]
+        }
+    ]
+}
