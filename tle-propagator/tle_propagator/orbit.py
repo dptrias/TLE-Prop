@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .constants import MU_EARTH
+from .constants import MU_EARTH, PI
 from .time import Epoch
 
 
@@ -68,34 +68,49 @@ class Vector3D:
         # Elevation angle
         return np.arcsin(self.z / self.r)
     
+    @staticmethod
+    def gpd(pos1: 'Vector3D', pos2: 'Vector3D') -> np.ndarray:
+        """Compute the global position difference between two position arrays (3xN)."""
+        return np.linalg.norm(pos1.coords - pos2.coords, axis=0, ord=2)
+    
+    @staticmethod
+    def cgpd(pos1: 'Vector3D', pos2: 'Vector3D') -> np.ndarray:
+        """Compute the cumulative global position difference between two position arrays (3xN)."""
+        return np.sqrt(np.sum(Vector3D.gpd(pos1, pos2)**2)/pos1.coords.shape[1])
+    
 @dataclass
 class KeplerianElements:
     """
     Keplerian orbital elements.
     
     Attributes:
-        a:     Semi-major axis (km)
-        e:     Eccentricity
-        i:     Inclination (rad)
+        sma:     Semi-major axis (km)
+        ecc:     Eccentricity
+        inc:     Inclination (rad)
         raan:  Right ascension of ascending node (rad)
         argp:  Argument of perigee (rad)
         theta: True anomaly (rad)
     """
-    a:     np.ndarray
-    e:     np.ndarray
-    i:     np.ndarray
+    sma:   np.ndarray
+    ecc:   np.ndarray
+    inc:   np.ndarray
     raan:  np.ndarray
     argp:  np.ndarray
     theta: np.ndarray
 
     def __post_init__(self):
         # Ensure all elemets have the same lengthº
-        N = self.a.shape[0]
-        for field in ['e', 'i', 'raan', 'argp', 'theta']:
+        N = self.sma.shape[0]
+        for field in ['ecc', 'inc', 'raan', 'argp', 'theta']:
             element_array = getattr(self, field)
             if element_array.shape[0] != N:
                 raise ValueError(f"All orbital elements must have the same length; got {N} and {element_array.shape[0]} for {field}.")
             setattr(self, field, element_array)
+
+    @property
+    def arglat(self) -> np.ndarray:
+        """Argument of latitude (rad)."""
+        return (self.argp + self.theta) % (2 * PI)
 
     @classmethod
     def from_pos_vel(cls, pos: Vector3D, vel: Vector3D):
@@ -103,19 +118,19 @@ class KeplerianElements:
         v = vel.r # Magnitude of velocity vector
         
         # Compute Keplerian elements
-        a = 1 / (2/r - v**2 / MU_EARTH) # Vis-viva equation
+        sma = 1 / (2/r - v**2 / MU_EARTH) # Vis-viva equation
         h = np.cross(pos.coords, vel.coords, axis=0) # Specific angular momentum vector
         e_vec = np.cross(vel.coords, h, axis=0) / MU_EARTH - pos.coords / r # Eccentricity vector
-        e = np.linalg.norm(e_vec, axis=0)
-        i = np.arccos(h[2, :] / np.linalg.norm(h, axis=0)) # Inclination
+        ecc = np.linalg.norm(e_vec, axis=0)
+        inc = np.arccos(h[2, :] / np.linalg.norm(h, axis=0)) # Inclination
         n = np.cross(np.array([[0], [0], [1]]), h, axis=0) # Ascending node vector
         n_xy = np.linalg.norm(n[0:2, :], axis=0)
         raan = np.arctan2(n[1, :]/n_xy, n[0, :]/n_xy)
         n_norm = np.linalg.norm(n, axis=0)
-        argp = np.sign(np.sum(np.cross(n / n_norm, e_vec, axis=0) * h, axis = 0)) * np.arccos(np.sum(n * e_vec, axis=0) / (n_norm * e))
-        theta = np.sign(np.sum(np.cross(e_vec, pos.coords, axis=0) * h, axis = 0)) * np.arccos(np.sum(e_vec * pos.coords, axis=0) / (e * r))
+        argp = np.sign(np.sum(np.cross(n / n_norm, e_vec, axis=0) * h, axis = 0)) * np.arccos(np.sum(n * e_vec, axis=0) / (n_norm * ecc))
+        theta = np.sign(np.sum(np.cross(e_vec, pos.coords, axis=0) * h, axis = 0)) * np.arccos(np.sum(e_vec * pos.coords, axis=0) / (ecc * r))
 
-        return cls(a, e, i, raan, argp, theta)
+        return cls(sma, ecc, inc, raan, argp, theta)
 
 class Orbit:
     """
@@ -131,41 +146,28 @@ class Orbit:
         radial: Radial unit vector
         along: Along-track unit vector
         cross: Cross-track unit vector
-        err_orbit: Orbit representing errors
+        res_orbit: Orbit representing residuals
     """
     pos: Vector3D
     vel: Vector3D
     epochs: list[Epoch]
-    # These attributes are kept as optionals so that Orbit can also be used for error representation
-    pef_pos:   Vector3D | None = None
-    pef_vel:   Vector3D | None = None
-    kepler:    KeplerianElements | None = None
-    radial:    Vector3D | None = None
-    along:     Vector3D | None = None
-    cross:     Vector3D | None = None
-    err_orbit: 'Orbit | None' = None
+    res_orbit: 'Orbit | None' = None
+    # Private attributes for lazy evaluation
+    _kepler:   KeplerianElements | None = None
+    _pef_pos:  Vector3D | None = None
+    _pef_vel:  Vector3D | None = None
+    _radial:   Vector3D | None = None
+    _along:    Vector3D | None = None
+    _cross:    Vector3D | None = None
 
-    def __init__(self, pos: Vector3D, vel: Vector3D, epochs: list[Epoch], kepler = None) -> None:
+    def __init__(self, pos: Vector3D, vel: Vector3D, epochs: list[Epoch], kepler: KeplerianElements | None = None) -> None:
         """This constructor is private; use classmethods from_pos_vel or from_keplerian instead."""
 
         # Assign position and velocity
         self.pos = pos
         self.vel = vel
         self.epochs = epochs
-        
-        # Full initilization if Keplerian elements are provided
-        if kepler is not None:
-            self.kepler = kepler
-
-            self.pef_pos, self.pef_vel = self._compute_pef(epochs)  # Convert to PEF frame
-
-            # Specific angular momentum vector
-            h = np.cross(pos.coords, vel.coords, axis=0) 
-
-            # Compute RAC frame unit vectors
-            self.radial = Vector3D(pos.coords / np.linalg.norm(pos.coords, axis=0)) # Radial unit vector
-            self.cross = Vector3D(h / np.linalg.norm(h, axis=0)) # Cross-track unit vector
-            self.along = Vector3D(np.cross(self.cross.coords, self.radial.coords, axis=0)) # Along-track unit vector
+        self._kepler = kepler
 
     def __add__(self, other: 'Orbit') -> 'Orbit':
         """Add two Orbit objects. Adds their position and velocity vectors."""
@@ -180,16 +182,15 @@ class Orbit:
         """Contructor from position and velocity vectors as raw numpy arrays."""
         pos_3d = Vector3D(pos_array)
         vel_3d = Vector3D(vel_array)
-        kepler = KeplerianElements.from_pos_vel(pos_3d, vel_3d)
-        return cls(pos_3d, vel_3d, epochs, kepler)
+        return cls(pos_3d, vel_3d, epochs)
 
     @classmethod
     def from_keplerian(cls, kepler: KeplerianElements, epochs: list[Epoch]) -> 'Orbit':
         """Constructor from Keplerian elements with KeplerianElements object."""
-        a, e, i, raan, argp, theta = (
-            kepler.a,
-            kepler.e,
-            kepler.i,
+        sma, ecc, inc, raan, argp, theta = (
+            kepler.sma,
+            kepler.ecc,
+            kepler.inc,
             kepler.raan,
             kepler.argp,
             kepler.theta,
@@ -200,8 +201,8 @@ class Orbit:
         sin_raan = np.sin(raan)
         cos_argp = np.cos(argp)
         sin_argp = np.sin(argp)
-        cos_i = np.cos(i)
-        sin_i = np.sin(i)
+        cos_i = np.cos(inc)
+        sin_i = np.sin(inc)
         l_1 = cos_raan * cos_argp - sin_raan * sin_argp * cos_i
         l_2 = -cos_raan * sin_argp - sin_raan * cos_argp * cos_i
         m_1 = sin_raan * cos_argp + cos_raan * sin_argp * cos_i
@@ -210,24 +211,24 @@ class Orbit:
         n_2 = cos_argp * sin_i
 
         # Radius
-        r = a * (1 - e**2) / (1 + e * np.cos(theta)) 
+        r = sma * (1 - ecc**2) / (1 + ecc * np.cos(theta)) 
         # Position in the orbital plane
         xi = r * np.cos(theta)
         eta = r * np.sin(theta) 
         # Position vector
-        pos = np.empty((3, a.shape[0]))
+        pos = np.empty((3, sma.shape[0]))
         pos[0, :] = l_1 * xi + l_2 * eta
         pos[1, :] = m_1 * xi + m_2 * eta
         pos[2, :] = n_1 * xi + n_2 * eta
         pos_3d = Vector3D(pos)
         
         # mu/H (H -> Angular momentum)
-        mu_H = np.sqrt(MU_EARTH / (a * (1 - e**2)))  
+        mu_H = np.sqrt(MU_EARTH / (sma * (1 - ecc**2)))  
         # Common factors for velocity components
         chi = mu_H * np.sin(theta)   
-        zeta = mu_H * (e + np.cos(theta))
+        zeta = mu_H * (ecc + np.cos(theta))
         # Velocity vector
-        vel = np.empty((3, a.shape[0]))
+        vel = np.empty((3, sma.shape[0]))
         vel[0, :] = -l_1 * chi + l_2 * zeta
         vel[1, :] = -m_1 * chi + m_2 * zeta
         vel[2, :] = -n_1 * chi + n_2 * zeta
@@ -235,19 +236,48 @@ class Orbit:
 
         return cls(pos_3d, vel_3d, epochs, kepler)
     
+    @property
+    def kepler(self) -> KeplerianElements:
+        """Get the Keplerian elements of the orbit."""
+        if self._kepler is None:
+            self._kepler = KeplerianElements.from_pos_vel(self.pos, self.vel)
+        return self._kepler
+
+    @property 
+    def pef_pos(self) -> Vector3D:
+        """Get the position and velocity in the PEF (Pseudo Earth Fixed) frame."""
+        if self._pef_pos is None:
+            self._pef_pos, self._pef_vel = self._compute_pef(self.epochs)
+        return self._pef_pos
+
+    @property
+    def pef_vel(self) -> Vector3D:
+        """Get the position and velocity in the PEF (Pseudo Earth Fixed) frame."""
+        if self._pef_vel is None:
+            self._pef_pos, self._pef_vel = self._compute_pef(self.epochs)
+        return self._pef_vel
+
+    @property
+    def rac_frame(self) -> list[Vector3D]:
+        # Specific angular momentum vector
+        h = np.cross(self.pos.coords, self.vel.coords, axis=0) 
+        # Compute RAC frame unit vectors
+        radial = Vector3D(self.pos.coords / np.linalg.norm(self.pos.coords, axis=0)) # Radial unit vector
+        cross = Vector3D(h / np.linalg.norm(h, axis=0)) # Cross-track unit vector
+        along = Vector3D(np.cross(cross.coords, radial.coords, axis=0)) # Along-track unit vector
+        return [radial, along, cross]
+
     def compare_orbit(self, other: 'Orbit') -> None:
         """Compare Orbit objects and store the absolute difference."""
-        self.err_orbit = other - self
+        self.res_orbit = other - self
 
     def rac(self, vector: Vector3D) -> Vector3D:
         """Convert a Vector3D from Cartesian to the orbit's RAC frame."""
-
-        if self.radial is None or self.along is None or self.cross is None: # Optional check
-            raise ValueError("RAC frame unit vectors are not defined for this Orbit.")
+        rac_frame = self.rac_frame
         coords_rac = np.empty_like(vector.coords)
-        coords_rac[0, :] = np.sum((vector * self.radial).coords, axis=0)
-        coords_rac[1, :] = np.sum((vector * self.along).coords, axis=0)
-        coords_rac[2, :] = np.sum((vector * self.cross).coords, axis=0)
+        coords_rac[0, :] = np.sum((vector * rac_frame[0]).coords, axis=0)
+        coords_rac[1, :] = np.sum((vector * rac_frame[1]).coords, axis=0)
+        coords_rac[2, :] = np.sum((vector * rac_frame[2]).coords, axis=0)
         return Vector3D(coords_rac)
     
     def _compute_pef(self, epoch: list[Epoch]) -> tuple[Vector3D, Vector3D]:

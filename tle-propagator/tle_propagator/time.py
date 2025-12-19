@@ -6,7 +6,10 @@ from datetime import datetime as datetime
 from math import trunc
 
 import numpy as np
+
 from .constants import DEG2RAD
+
+
 @dataclass
 class Epoch:
     """
@@ -25,6 +28,10 @@ class Epoch:
             self.jd += np.sign(fr)
             fr -= np.sign(fr)
         self.fr = fr
+
+    def __add__(self, other: float) -> 'Epoch':
+        """Add a time delta in days to the epoch."""
+        return Epoch(self.jd, self.fr + other)
 
     @classmethod
     def from_mjd(cls, mjd: float) -> 'Epoch':
@@ -84,7 +91,7 @@ class Epoch:
     
     @property
     def string(self) -> str:
-        """ISO 8601 string representation of the epoch."""
+        """ISO 8601 string representation of the epoch. Format: 'YYYY-MM-DDTHH:MM:SSZ'."""
         Y, m, d, H, M, S = self.calendar
         return f"{Y:04}-{m:02}-{d:02}T{H:02}:{M:02}:{S:02}Z"
     

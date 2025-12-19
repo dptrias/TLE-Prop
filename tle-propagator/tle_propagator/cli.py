@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .tle_propagator import Config, TLEPropagator
+
 # TODO verbose, config YAML, integrator/force model selection
 
 def cli_parser() -> argparse.ArgumentParser:
@@ -22,7 +23,6 @@ def cli_parser() -> argparse.ArgumentParser:
     # Output parameters
     parser.add_argument("-o", "--output_dir", type=str, default="output", help="Output directory")
     parser.add_argument("--plot",             action="store_true",        help="Generate plots")
-    parser.add_argument("--yaml",             action ="store_true",       help="Generate YAML answer sheet")
     
     return parser
 
@@ -30,17 +30,20 @@ def main() -> None:
     parser = cli_parser()
     args = parser.parse_args()
 
-    # Select input source
+    # Load TLE data
     input_file = Path()
+    tle = []
     if args.input_file is not None:
         input_file = Path(args.input_file)
         if not input_file.exists() or not input_file.is_file():
             print(f"Error: Input file {input_file} does not exist or is not a file.", file=sys.stderr)
             sys.exit(1)
+        with open(input_file) as tle_file:
+            tle = tle_file.read().splitlines()
     elif args.norad_id is not None:
-        from .tle_retriever import retrieve_tle
+        from .utils import request_tle
         try:
-            input_file = retrieve_tle(args.norad_id)
+            tle = request_tle(args.norad_id)
         except Exception as e:
             print(f"Error: could not retrieve TLE data. {e}", file=sys.stderr)
             sys.exit(1)
@@ -49,12 +52,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tle_propagator = TLEPropagator(
+        tle = tle,
         config=Config(
-            input_file=input_file,
             output_dir=output_dir,
             times=(args.start_time, args.end_time, args.time_step),
-            plot=args.plot,
-            yaml=args.yaml
+            plot=args.plot
         )
     )
     try:

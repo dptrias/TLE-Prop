@@ -14,7 +14,7 @@ from sgp4.conveniences import sat_epoch_datetime
 
 from ..orbit import Orbit
 from ..time import Epoch
-from .force_models import get_force_model
+from .force_models import ForceModel
 from .integrators import get_integrator
 
 
@@ -66,15 +66,12 @@ class Propagator:
 
     def propagate_sgp4(
         self,
-        t0: float,
-        tf: float,
-        dt: float
+        times: np.ndarray,
     ) -> PropagationResult:
         """
         Propagate using the SGP4 model from the sgp4 library.
         Reference: https://pypi.org/project/sgp4/
         """
-        times = np.linspace(t0, tf, int((tf - t0)/dt) + 1)
         epochs = Epoch.epoch_list(self.tle_epoch, times) # Epochs for each time step
         jd_array = np.array([ep.jd for ep in epochs])
         fr_array = np.array([ep.fr for ep in epochs])
@@ -89,8 +86,7 @@ class Propagator:
     def propagate_int_fm(
         self,
         integrator: str,
-        force_model: str,
-        tf: float,
+        force_model: ForceModel,
         state0: np.ndarray,
         **kwargs
     ) -> PropagationResult:
@@ -103,7 +99,7 @@ class Propagator:
             Monotonically increasing times. Only the first and last values are used
             as integration bounds [t0, tf].
         state0 : np.ndarray, shape (6,)
-            Initial state at t0: [x, y, z, vx, vy, vz] (or similar).
+            Initial state at 0: [x, y, z, vx, vy, vz] (or similar).
         **kwargs : dict
             Additional arguments passed to the integrator (e.g. dt, tol).
 
@@ -114,16 +110,20 @@ class Propagator:
         """
         # Retrieve integrator and force model
         int = get_integrator(integrator)
-        frc_mdl = get_force_model(force_model)
 
         # Perform integration
-        int_result = int(state0, tf, self.dynamics(frc_mdl), **kwargs) 
+        int_result = int(state0, self.dynamics(force_model), **kwargs) 
         
-        return PropagationResult(states=int_result.states, times=int_result.times, elapsed=int_result.elapsed, tle_epoch=self.tle_epoch)
+        return PropagationResult(
+            states = int_result.states,
+            times = int_result.times,
+            elapsed = int_result.elapsed,
+            tle_epoch = self.tle_epoch
+        )
         
     @staticmethod
     def dynamics(
-        force_model: type,
+        force_model: ForceModel,
     ) -> Callable[[float, np.ndarray], np.ndarray]:
         """
         Create a dynamics function compatible with integrators from a force model.
@@ -139,7 +139,7 @@ class Propagator:
             Dynamics function that computes the derivative of the state.
         """
         def dyn(t: float, state: np.ndarray) -> np.ndarray:
-            acc = getattr(force_model, "acc")(force_model(), t, state)
+            acc = force_model.acc(t, state)
             return np.hstack((state[3:], acc))
         
         return dyn

@@ -50,15 +50,14 @@ def integrator(name: str):
         
         def wrapper(
             state0: np.ndarray,
-            tf: float,
             dynamics: Callable[[float, np.ndarray], np.ndarray],
             **kwargs
         ) -> IntegrationResult:
             start = perf_counter() # Start timing
-            y, t = func(state0, tf, dynamics, **kwargs)
+            y, t = func(state0, dynamics, **kwargs)
             end = perf_counter() # End timing
             elapsed = end - start
-            return IntegrationResult(states=y, times=t, elapsed=elapsed)
+            return IntegrationResult(states = y, times = t, elapsed = elapsed)
 
         INTEGRATOR_REGISTRY[name] = wrapper
         return wrapper
@@ -73,41 +72,62 @@ def get_integrator(name: str) -> Callable:
         raise ValueError(f"Integrator '{name}' not found. Available: {list(INTEGRATOR_REGISTRY.keys())}")
     return INTEGRATOR_REGISTRY[name]
 
-def allocate_solution(y0: np.ndarray, times: np.ndarray) -> np.ndarray:
+def allocate_solution(y0: np.ndarray, N: int) -> np.ndarray:
     """
     Create state array of size 6xN_steps.
     """
-    y = np.zeros((6, len(times)), dtype=y0.dtype)
+    y = np.zeros((6, N), dtype=y0.dtype)
     y[:, 0] = y0
     return y
 
 ## INTEGRATION SCHEMES
 # Euler method
+class Euler:
+    """
+    Explict Euler method with fixed step.
+    """
+
+    def __init__(
+        self,
+        f: Callable[[float, np.ndarray], np.ndarray],
+    ) -> None:
+        self.f = f
+
+    def step(
+        self,
+        t: float,
+        y: np.ndarray,
+        dt: float,
+    ) -> np.ndarray:
+        """
+        Perform a single Euler step.
+        """
+        return y + self.f(t, y) * dt
+
+
 @integrator("euler")
 def euler(
     y0: np.ndarray,
-    tf: float,
     dynamics: Callable,
-    dt: float
+    time: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Explict Euler method with fixed step.
-    Imposes uniform spacing from t0 to tf with step round((tf - t0) / dt) + 1) steps. As a result the input dt may not be equal to the actual step used.
+    Explict Euler method over a time vector.
     """
-    N_steps = int(np.round(tf / dt)) + 1
-    t = np.linspace(0, tf, num=N_steps)
-    y = allocate_solution(y0, t)
+    N_steps = len(time)
+    t = time
+    integrator = Euler(dynamics)
+    y = allocate_solution(y0, len(t))
 
-    dt = t[1] - t[0]  # Recompute dt based on actual spacing
-    for i in range(1, len(t)):
-        y[:, i] = y[:, i-1] + dynamics(t[i-1], y[:, i-1]) * dt
+    for i in range(1, N_steps):
+        y[:, i] = integrator.step(t[i-1], y[:, i-1], t[i] - t[i-1]) 
     return y, t
 
 # Tsitouras 5(4) Runge-Kutta method
 # Butcher tableau coefficients
 C_TS  = np.array([0, 0.161, 0.327, 0.9, 0.9800255409045097, 1.0, 1.0]).T
 B5_TS = np.array([0.09646076681806523, 0.01, 0.4798896504144996, 1.379008574103742, -3.290069515436081, 2.324710524099774, 0.0]).T
-B4_TS = np.array([0.001780011052226, 0.000816434459657, -0.007880878010262, 0.144711007173263, -0.582357165452555, 0.458082105929187, 1.0/66.0])
+B4_TS = np.array([0.001780011052226, 0.000816434459657, -0.007880878010262, 0.144711007173263, -0.582357165452555, 0.458082105929187, 1.0/66.0]).T
 A_TS  = np.array([
     [0.0,                   0.0,                0.0,                0.0,                  0.0,                  0.0,               0.0],
     [0.161,                 0.0,                0.0,                0.0,                  0.0,                  0.0,               0.0],
@@ -120,18 +140,24 @@ A_TS  = np.array([
 class Tsitouras45:
     """
     Tsitouras 5(4) Runge–Kutta integrator with FSAL and embedded error estimate.
-    Refernce: https://www.sciencedirect.com/science/article/pii/S0898122111004706
+    Reference: https://www.sciencedirect.com/science/article/pii/S0898122111004706
     """
 
     def __init__(
         self,
         f: Callable[[float, np.ndarray], np.ndarray],
         dt: float,
-        tol: float = 1e-6,
+        tol: float = 1,
+        dtmin: float = 1e-2
     ) -> None:
         self.f = f
         self.dt = dt
         self.tol = tol
+        self.dtmin = dtmin
+
+        # Preallocate work arrays for the state vector
+        self.k = np.empty((7, 6), dtype=float)  # Stages k0..k6
+        self.yi = np.empty(6, dtype=float)      # Intermediate y
 
     def step(
         self,
@@ -139,7 +165,7 @@ class Tsitouras45:
         y: np.ndarray,
         dt: float,
         k1: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Perform a single Tsitouras 5(4) step.
 
@@ -147,120 +173,139 @@ class Tsitouras45:
         -------
         y5 : 5th-order solution at t + dt
         y4 : 4th-order embedded solution at t + dt
-        err : error estimate ||y5 - y4||
-        k_last : last stage derivative (FSAL) = f(t + dt, y5)
+        k1 : last stage derivative (FSAL) = f(t + dt, y5)
         """
-        k: list[np.ndarray | None] = [None] * 7 # k1 to k7
+        k = self.k
+        yi = self.yi
 
+        # FSAL: reuse k1 from previous step if available
         if k1 is None:
-            k[0] = self.f(t, y)
+            k[0, :] = self.f(t, y)
         else:
-            k[0] = k1
+            k[0, :] = k1
             
+        # Stages 2 to 7
         # k_i = f(t_i + c_i * dt_i, y_i + dt_i * sum_j a_ij * k_j)
         for i in range(1, 7):
-            yi = y.copy() 
-            for j in range(i):
-                a_ij = A_TS[i, j]
-                if a_ij != 0.0:
-                    yi += dt * a_ij * k[j] 
-            k[i] = self.f(t + C_TS[i] * dt, yi)
-
+            yi[:] = y + dt * (A_TS[i, :i] @ k[:i, :])
+            k[i, :] = self.f(t + C_TS[i] * dt, yi)
+            
         # 5th-order and 4th-order solutions
-        y5 = y + dt * sum(B5_TS[i] * k[i] for i in range(7)) # y_i+1 5th-order
-        y4 = y + dt * sum(B4_TS[i] * k[i] for i in range(7)) # y_i+1 4th-order
-        E_i = np.linalg.norm(y5 - y4, ord=2)
-
-        return y5, y4, E_i, k[-1] # type: ignore
+        return y + dt * (B5_TS @ k), y + dt * (B4_TS @ k), k[6, :] # type: ignore
     
-    def step_size(self, dt: float, E_i: float):
+    def step_size(self, dt: float, E_i: float) -> float:
         """
         dt_i+1 = 0.9 * dt_i * (TOL / E_i)^(1/5)
         """
-        return 0.9 * dt * (self.tol / E_i) ** 0.2
-
+        return (0.9 * dt * (self.tol / E_i) ** 0.2)
+    
 @integrator("tsit45")
 def tsit45(
     y0: np.ndarray,
-    tf: float,
     dynamics: Callable,
-    tol: float = 1e-6,
-    dt0: float = 10.0,
+    t0: float,
+    tf: float,
+    tol: float = 1,
+    dt0: float = 1.0,
+    dtmin: float = 1e-2,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Tsitouras 5(4) Runge-Kutta integrator with adaptive step size.
     """
-    times = [0.0]
-    y_list = [y0]
+    # Calculate maximum number of steps based on minimum step size
+    # Add a small buffer to ensure we can reach tf even with floating point issues
+    max_steps = int(np.round((tf - t0) / dtmin)) + 1
+
+    # Preallocate solution arrays
+    times = np.zeros(max_steps)
+    states = allocate_solution(y0, max_steps)
+    
+    # Initial conditions
+    times[0] = 0.0
+    
     t = 0.0
+    tf_rel = tf - t0
     y = y0
     dt = dt0
-
-    integrator = Tsitouras45(dynamics, tol=tol, dt=dt)
-
+    
+    integrator = Tsitouras45(dynamics, dt=dt, tol=tol, dtmin=dtmin)
     k1: np.ndarray | None = None
-
-    while (t - tf) < -1e-12:  # While t < tf
-        if t + dt > tf:
-            dt = tf - t  # Adjust last step to end exactly at tf
-
-        y, _, E_i, k1 = integrator.step(t, y, dt, k1) # Perform step, keep only the 5th-order solution
-        dt_1 = integrator.step_size(dt, E_i) # Compute new step size
-
-        if E_i <= tol:
+    
+    step_idx = 0
+    
+    while (t - tf_rel) < -1e-12 and step_idx < max_steps - 1:
+        if t + dt > tf_rel:
+            dt = tf_rel - t
+            
+        y5, y4, k1_next = integrator.step(t, y, dt, k1)
+        E_i = np.linalg.norm(y5 - y4, ord=2)
+        
+        dt_new = integrator.step_size(dt, float(E_i))
+        
+        # Check if we should accept the step
+        # Accept if error is within tolerance OR if we are already at minimum step size
+        if E_i <= tol or dt <= dtmin * 1.001:
             # Accept step
             t += dt
-            times.append(t)
-            y_list.append(y)
-            dt = dt_1 # Update step size for next step
+            y = y5
+            step_idx += 1
+            times[step_idx] = t
+            states[:, step_idx] = y
+            k1 = k1_next
+            
+            # Update dt for next step
+            dt = max(dt_new, dtmin)
         else:
-            # Reject step, do not update time or store state, update step size and retry
-            dt = dt_1
-
-    return np.array(y_list).T, np.array(times)
+            # Reject step
+            k1 = None # Reset FSAL
+            # Retry with smaller step, but not smaller than dtmin
+            dt = max(dt_new, dtmin)
+            
+    return states[:, :step_idx+1], times[:step_idx+1] + t0
 
 @integrator("tsit4")
 def tsit4(
     y0: np.ndarray,
-    tf: float,
-    dynamics,
-    dt: float,
+    dynamics: Callable,
+    times: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Fixed-step Tsitouras 4th-order Runge-Kutta integrator.
     """
-    N_steps = int(np.round(tf / dt)) + 1
-    t = np.linspace(0, tf, N_steps)
-    y = allocate_solution(y0, t)
+    N_steps = len(times)
+    t = times
 
-    integrator = Tsitouras45(dynamics, dt=dt)
+    y = allocate_solution(y0, len(t))
+
+    integrator = Tsitouras45(dynamics, dt = t[1] - t[0])
 
     k1: np.ndarray | None = None
 
     for i in range(1, N_steps):
-        _, y[:, i], _, k1 = integrator.step(t[i-1], y[:, i-1], dt, k1) # Perform step, keep only the 4th-order solution
+        _, y[:, i], k1 = integrator.step(t[i-1], y[:, i-1], t[i] - t[i-1], k1) # Perform step, keep only the 4th-order solution
 
     return y, t
 
 @integrator("tsit5")
 def tsit5(
     y0: np.ndarray,
-    tf: float,
     dynamics: Callable,
-    dt: float,
+    times: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Fixed-step Tsitouras 4th-order Runge-Kutta integrator.
     """
-    N_steps = int(np.round(tf / dt)) + 1
-    t = np.linspace(0, tf, N_steps)
-    y = allocate_solution(y0, t)
+    N_steps = len(times)
+    t = times
 
-    integrator = Tsitouras45(dynamics, dt=dt)
+    y = allocate_solution(y0, len(t))
+
+    integrator = Tsitouras45(dynamics, dt=t[1] - t[0])
 
     k1: np.ndarray | None = None
 
     for i in range(1, N_steps):
-        y[:, i], _, _, k1 = integrator.step(t[i-1], y[:, i-1], dt, k1) # Perform step, keep only the 5th-order solution
+        y[:, i], _, k1 = integrator.step(t[i-1], y[:, i-1], t[i] - t[i-1], k1) # Perform step, keep only the 5th-order solution
 
     return y, t
+
