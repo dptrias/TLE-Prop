@@ -27,7 +27,9 @@ class Config:
     """
     output_dir: Path
     times: tuple[float, float, float] # (ti, tf, dt) in seconds
-    plot: bool = False
+    integrator: str
+    force_model: dict
+    plot: bool
     # integrator: str 
     # force_model: str
 class TLEPropagator:
@@ -96,15 +98,15 @@ class TLEPropagator:
         # Force model definition
         force_model = ForceModel(
             satrec = self.satellite,
-            j2 = self.cfg.force_model.j2,
-            drag = self.cfg.force_model.drag,
-            srp = self.cfg.force_model.srp,
-            third_body = self.cfg.force_model.third_body
+            j2 = self.cfg.force_model["j2"],
+            drag = self.cfg.force_model["drag"],
+            srp = self.cfg.force_model["srp"],
+            third_body = self.cfg.force_model["third_body"]
         )
         # Integrated orbit
         self.propagations["integrated"] = (
             self.propagator.propagate_int_fm(
-                integrator = self.cfg.force_model.integrator,
+                integrator = self.cfg.integrator,
                 force_model = force_model,
                 state0 = state0_sgp4,
                 times = t_vec

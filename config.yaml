@@ -1,0 +1,6 @@
+force_model:
+  - j2: true
+  - drag: false
+  - tbp: true
+  - srp: true
+integrator: tsit45
